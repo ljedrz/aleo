@@ -20,7 +20,6 @@ use snarkvm::{file::Manifest, package::Package};
 use anyhow::{ensure, Result};
 use clap::Parser;
 use colored::*;
-use std::sync::Arc;
 
 /// Commands to operate a local development node.
 #[derive(Debug, Parser)]
@@ -65,7 +64,7 @@ impl Node {
                 let private_key = manifest.development_private_key();
 
                 // Initialize the ledger.
-                let ledger = Arc::new(Ledger::<Network>::load(private_key)?);
+                let ledger = Ledger::<Network>::load(private_key)?;
 
                 // Deploy the local program.
                 if !nodeploy {
