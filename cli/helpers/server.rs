@@ -5,7 +5,10 @@ use anyhow::Result;
 use core::marker::PhantomData;
 use indexmap::IndexMap;
 use std::sync::Arc;
-use tokio::{sync::mpsc, task::JoinHandle};
+use tokio::{
+    sync::{mpsc, oneshot},
+    task::JoinHandle,
+};
 use warp::{http::StatusCode, reject, reply, Filter, Rejection, Reply};
 
 /// An enum of error handlers for the server.
@@ -135,34 +138,38 @@ impl<N: Network> Server<N> {
             .thread_stack_size(8 * 1024 * 1024)
             .build()?;
 
-        // Initialize the server.
-        let handles = runtime.block_on(async move {
-            // Initialize a vector for the server handles.
-            let mut handles = Vec::new();
+        // Initialize a vector for the server handles.
+        let mut handles = Vec::new();
 
-            // Spawn the server.
-            handles.push(tokio::spawn(async move {
-                // Prepare the list of routes.
-                let routes = latest_height
-                    .or(latest_hash)
-                    .or(latest_block)
-                    .or(get_block)
-                    .or(state_path)
-                    .or(records_all)
-                    .or(records_spent)
-                    .or(records_unspent)
-                    .or(transaction_broadcast);
-                // Start the server.
-                println!("\n🌐 Server is running at http://0.0.0.0:4180");
-                warp::serve(routes).run(([0, 0, 0, 0], 4180)).await;
-            }));
+        // Spawn the ledger handler.
+        handles.push(runtime.block_on(Self::start_handler(ledger, ledger_receiver)));
 
-            // Spawn the ledger handler.
-            handles.push(Self::start_handler(ledger, ledger_receiver));
+        // Use a oneshot channel to ensure that the warp task has started.
+        let (tx_warp_ready, rx_warp_ready) = oneshot::channel::<()>();
 
-            // Return the handles.
-            handles
-        });
+        // Spawn the server.
+        handles.push(tokio::spawn(async move {
+            // Prepare the list of routes.
+            let routes = latest_height
+                .or(latest_hash)
+                .or(latest_block)
+                .or(get_block)
+                .or(state_path)
+                .or(records_all)
+                .or(records_spent)
+                .or(records_unspent)
+                .or(transaction_broadcast);
+
+            // Notify that the warp server task is ready.
+            tx_warp_ready.send(()).unwrap();
+
+            // Start the server.
+            println!("\n🌐 Server is running at http://0.0.0.0:4180");
+            warp::serve(routes).run(([0, 0, 0, 0], 4180)).await;
+        }));
+
+        // Wait until the readiness notification is received.
+        runtime.block_on(rx_warp_ready).unwrap();
 
         Ok(Self {
             runtime,
@@ -173,8 +180,13 @@ impl<N: Network> Server<N> {
     }
 
     /// Initializes a ledger handler.
-    fn start_handler(ledger: Arc<Ledger<N>>, mut ledger_receiver: LedgerReceiver<N>) -> JoinHandle<()> {
-        tokio::spawn(async move {
+    async fn start_handler(ledger: Arc<Ledger<N>>, mut ledger_receiver: LedgerReceiver<N>) -> JoinHandle<()> {
+        // Use a oneshot channel to ensure that the handler task has started.
+        let (tx_handler_ready, rx_handler_ready) = oneshot::channel::<()>();
+
+        let handle = tokio::spawn(async move {
+            tx_handler_ready.send(()).unwrap();
+
             while let Some(request) = ledger_receiver.recv().await {
                 match request {
                     LedgerRequest::TransactionBroadcast(transaction) => {
@@ -184,7 +196,12 @@ impl<N: Network> Server<N> {
                     }
                 };
             }
-        })
+        });
+
+        // Wait until the readiness notification is received.
+        rx_handler_ready.await.unwrap();
+
+        handle
     }
 }
 
